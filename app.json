@@ -1,0 +1,61 @@
+{
+  "expo": {
+    "name": "PlateWise PH",
+    "slug": "mmda-dfa-parser",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "package": "edu.pup.cosc302.group12.mmdadfaparser",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#F5F7FA"
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow $(PRODUCT_NAME) to use the camera to scan license plates.",
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Allow $(PRODUCT_NAME) to use the camera to scan license plates.",
+          "photosPermission": "Allow $(PRODUCT_NAME) to open plate photos from your gallery."
+        }
+      ],
+      "expo-font"
+    ],
+    "backgroundColor": "#F5F7FA",
+    "extra": {
+      "eas": {
+        "projectId": "32888102-a271-41ed-bf7a-ee4295e7a84f"
+      }
+    }
+  }
+}
