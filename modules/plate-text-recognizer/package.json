@@ -1,0 +1,7 @@
+{
+  "name": "plate-text-recognizer",
+  "version": "1.0.0",
+  "description": "PlateWise PH (COSC 302 Group 12): on-device Google ML Kit text recognition for license plates",
+  "main": "index.js",
+  "private": true
+}

@@ -1,0 +1,22 @@
+// PlateWise PH — COSC 302 Group 12
+// Local Expo module: on-device Google ML Kit text recognition (bundled model, works offline).
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'edu.pup.cosc302.group12'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.platetextrecognizer"
+  defaultConfig {
+    versionCode 1
+    versionName "1.0.0"
+  }
+}
+
+dependencies {
+  // Bundled Latin model: shipped inside the APK, no Google Play Services download needed.
+  implementation 'com.google.mlkit:text-recognition:16.0.1'
+}
