@@ -22,7 +22,10 @@
  *         L    = { A, B, ..., Z }                       (any letter)
  *         D    = { 0, 1, ..., 9 }                       (any digit)
  *         Day  = { Mon, Tue, Wed, Thu, Fri, Sat, Sun, Hol }  (one symbol each)
- *         Time = { p, o }   p = 7:00–10:00 a.m. or 5:00–8:00 p.m., o = otherwise
+ *         Time = { p, o }   p = inside the city's coding hours, o = otherwise
+ *                           (MMDA: 7:00–10:00 a.m. or 5:00–8:00 p.m.; Makati: 7:00 a.m.–7:00 p.m.)
+ *         The city and holiday calendar only choose which Day/Time symbol is fed in
+ *         (CodingRules.js, preprocessing). They never change Q, Σ or δ.
  *    q0 = S0
  *    F  = { SC, SA }        SC = S_Coding, SA = S_Allowed
  *    SX = trap state (every undrawn transition in Figure 1 goes here)

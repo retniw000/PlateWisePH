@@ -18,7 +18,10 @@
  *                                  formatting anomalies into a clean
  *                                  character array (standardizeInput).
  *    3. Calendar + Time symbols  – converts the day into one symbol
- *                                  (Mon … Sun, Hol) and the time into 'p'/'o'.
+ *                                  (Mon … Sun, Hol; national holidays are
+ *                                  detected from the calendar) and the time
+ *                                  into 'p'/'o' using the selected city's
+ *                                  coding hours (CodingRules.js).
  *    4. Automata Acceptor        – hands the symbol array to DFAEngine.js and
  *                                  shows only the final verdict (the DFA runs
  *                                  behind the scenes; no trace is displayed).
@@ -31,6 +34,7 @@
 
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AccessibilityInfo,
   ActivityIndicator,
   KeyboardAvoidingView,
   Alert,
@@ -47,6 +51,7 @@ import {
   Switch,
   Text,
   TextInput,
+  UIManager,
   View,
   useColorScheme,
 } from 'react-native';
@@ -56,12 +61,26 @@ import * as SplashScreen from 'expo-splash-screen';
 import { useFonts } from 'expo-font';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
+import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
+import { Directory, File, Paths } from 'expo-file-system';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import Svg, { Path } from 'react-native-svg';
+import Svg, { Defs, Path, RadialGradient, Rect, Stop } from 'react-native-svg';
+import { BlurTargetView, BlurView } from 'expo-blur';
 import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 
 import { ML_KIT_AVAILABLE, recognizeWithMlKit } from './PlateOCR';
 import { DAY_SYMBOLS, GROUP_CODING_DAY, VERDICT, runDFA } from './DFAEngine';
+import {
+  clockLabel,
+  holidayOn,
+  hoursShort,
+  nextDateFor,
+  nextHoliday,
+  rulesFor,
+  timeToSymbol,
+  windowAt,
+  windowShort,
+} from './CodingRules';
 
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
@@ -264,16 +283,8 @@ export function standardizeInput(raw, source = 'manual') {
 // ---------------------------------------------------------------------------
 const JS_DAY_TO_SYMBOL = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-/** Peak windows in minutes from midnight, inclusive: 7:00–10:00 a.m. and 5:00–8:00 p.m. */
-export const PEAK_WINDOWS = [
-  { start: 7 * 60, end: 10 * 60 },
-  { start: 17 * 60, end: 20 * 60 },
-];
-
-export function timeToSymbol(hours24, minutes) {
-  const t = hours24 * 60 + minutes;
-  return PEAK_WINDOWS.some((w) => t >= w.start && t <= w.end) ? 'p' : 'o';
-}
+// Peak windows per city and the holiday calendar live in CodingRules.js:
+//   timeToSymbol(h, m, city) → 'p' | 'o'     holidayOn(date) → holiday name | null
 
 const pad = (n) => String(n).padStart(2, '0');
 const to24 = (h12, mer) => (h12 % 12) + (mer === 'PM' ? 12 : 0);
@@ -302,10 +313,10 @@ function plateGroup(chars) {
 }
 
 /** Full pipeline: standardize → build symbol string w → run M. */
-function buildCheck({ raw, source, day, h24, m, holiday, mode, city }) {
+function buildCheck({ raw, source, day, h24, m, holiday, holidayName = null, mode, city }) {
   const std = standardizeInput(raw, source);
   const daySymbol = holiday ? 'Hol' : day;
-  const timeSymbol = timeToSymbol(h24, m);
+  const timeSymbol = timeToSymbol(h24, m, city);
   const symbols = std.chars.length ? [...std.chars, daySymbol, timeSymbol] : [];
   const result = runDFA(symbols);
   const valid = result.verdict !== VERDICT.REJECTED;
@@ -319,38 +330,54 @@ function buildCheck({ raw, source, day, h24, m, holiday, mode, city }) {
     day,
     daySymbol,
     holiday,
+    holidayName,
     timeLabel: label12(h24, m),
     timeSymbol,
     mode,
     city,
+    rules: rulesFor(city),
   };
 }
+
+/**
+ * Holiday status for a date: the national calendar first, then the manual switch
+ * (for Eid'l Fitr / Eid'l Adha, local holidays or sudden suspensions).
+ */
+function holidayFor(date, manual) {
+  const name = holidayOn(date);
+  if (name) return { holiday: true, holidayName: name, auto: true };
+  return { holiday: !!manual, holidayName: null, auto: false };
+}
+
+const shortDate = (d) => d.toLocaleDateString('en-PH', { month: 'short', day: 'numeric' });
 
 /**
  * Coding status of one car at a given moment (runs the same DFA check).
  * kind: 'coding' (restricted now) | 'codingDay' (coding day, outside the hours)
  *       | 'free' (not its coding day) | 'holiday' | 'invalid'
  */
-function carStatus(plate, now, holiday) {
+function carStatus(plate, now, manualHoliday, city) {
   const h24 = now.getHours();
   const m = now.getMinutes();
   const day = JS_DAY_TO_SYMBOL[now.getDay()];
-  const c = buildCheck({ raw: plate, source: 'manual', day, h24, m, holiday, mode: 'live', city: '' });
+  const hol = holidayFor(now, manualHoliday);
+  const c = buildCheck({ raw: plate, source: 'manual', day, h24, m, ...hol, mode: 'live', city });
   const codingDay = c.result.codingDay;
   const t = h24 * 60 + m;
+  const { inside, next } = windowAt(city, t);
   if (!c.valid) return { kind: 'invalid', label: 'Invalid plate', sub: 'Edit or remove this car.', check: c };
   if (c.result.verdict === VERDICT.CODING) {
-    const until = t <= 10 * 60 ? '10:00 AM' : '8:00 PM';
-    return { kind: 'coding', label: 'In coding now', sub: `Restricted until ${until}`, check: c };
+    return { kind: 'coding', label: 'In coding now', sub: `Restricted until ${clockLabel(inside.end)}`, check: c };
   }
   if (c.result.path.includes('SR')) {
     let sub = 'Coding is over for today';
-    if (t < 7 * 60) sub = 'Coding starts at 7:00 AM';
-    else if (t < 17 * 60) sub = 'Coding again 5:00–8:00 PM';
+    if (next && next === rulesFor(city).windows[0]) sub = `Coding starts at ${clockLabel(next.start)}`;
+    else if (next) sub = `Coding again ${windowShort(next)}`;
     return { kind: 'codingDay', label: 'Coding day', sub, check: c };
   }
-  if (holiday) {
-    return { kind: 'holiday', label: 'No coding', sub: `Holiday · usual coding day ${DAY_NAME[codingDay]}`, check: c };
+  if (hol.holiday) {
+    const why = hol.holidayName || 'Holiday';
+    return { kind: 'holiday', label: 'No coding', sub: `${why} · usual coding day ${DAY_NAME[codingDay]}`, check: c };
   }
   return { kind: 'free', label: 'No coding today', sub: `Coding day: ${DAY_NAME[codingDay]}`, check: c };
 }
@@ -358,10 +385,19 @@ function carStatus(plate, now, holiday) {
 // ============================================================================
 //  THEME
 // ============================================================================
+// Glass look: cards and chips are translucent over a soft colour wash (GlassBackdrop);
+// the tab bar is real blur (expo-blur). Sheets stay solid so their text never sits on content.
 const LIGHT = {
-  bg: '#F5F7FA',
-  card: '#FFFFFF',
-  cardLine: '#EDF1F5',
+  bg: '#EEF2F7',
+  card: 'rgba(255,255,255,0.62)',
+  cardLine: 'rgba(255,255,255,0.95)',
+  sheet: '#FFFFFF',
+  blob1: '#7CCFCB',
+  blob2: '#9DB8E8',
+  blob3: '#F2C6A6',
+  tabFill: 'rgba(255,255,255,0.45)',
+  tabRim: 'rgba(255,255,255,0.9)',
+  tabInactive: '#55667A',
   surfaceAlt: '#F3F6F9',
   rowLine: '#F0F3F6',
   navy: '#152A45',
@@ -393,8 +429,15 @@ const LIGHT = {
 
 const DARK = {
   bg: '#0B1420',
-  card: '#142131',
-  cardLine: '#1E2D40',
+  card: 'rgba(30,46,66,0.55)',
+  cardLine: 'rgba(255,255,255,0.10)',
+  sheet: '#142131',
+  blob1: '#1F6A6E',
+  blob2: '#27477A',
+  blob3: '#4A3458',
+  tabFill: 'rgba(16,28,44,0.45)',
+  tabRim: 'rgba(255,255,255,0.14)',
+  tabInactive: '#9AABBE',
   surfaceAlt: '#1C2A3C',
   rowLine: '#1E2D40',
   navy: '#1A3050',
@@ -439,11 +482,11 @@ const ThemeContext = createContext({ mode: 'system', scheme: 'light', setMode: (
 const useTheme = () => useContext(ThemeContext);
 
 const F = {
-  r: 'Inter_400Regular',
-  m: 'Inter_500Medium',
-  s: 'Inter_600SemiBold',
-  b: 'Inter_700Bold',
-  x: 'Inter_800ExtraBold',
+  r: 'Geist_400Regular',
+  m: 'Geist_500Medium',
+  s: 'Geist_600SemiBold',
+  b: 'Geist_700Bold',
+  x: 'Geist_800ExtraBold',
 };
 
 const MONO = Platform.select({ ios: 'Menlo', default: 'monospace' });
@@ -472,6 +515,73 @@ async function clearStep() {
     /* best effort */
   }
 }
+// ---------------------------------------------------------------------------
+//  Car photos: kept in the app's own storage (the picker hands back a temp file
+//  that Android may clear). Only the file's URI is stored with the car.
+// ---------------------------------------------------------------------------
+const PHOTO_DIR = 'car-photos';
+
+/** Lets the user take or pick a photo; resolves to a stored file URI, or null if cancelled. */
+function pickCarPhoto() {
+  return new Promise((resolve) => {
+    const run = async (useCamera) => {
+      try {
+        if (useCamera) {
+          const perm = await ImagePicker.requestCameraPermissionsAsync();
+          if (!perm.granted) {
+            Alert.alert('Camera not allowed', 'Allow camera access in Settings, or choose a photo instead.');
+            return resolve(null);
+          }
+        }
+        await markStep(useCamera ? 'opening the camera for a car photo' : 'opening the photo picker');
+        const opts = { mediaTypes: ['images'], allowsEditing: true, aspect: [16, 9], quality: 0.9 };
+        const picked = useCamera ? await ImagePicker.launchCameraAsync(opts) : await ImagePicker.launchImageLibraryAsync(opts);
+        await clearStep();
+        if (picked.canceled || !picked.assets?.length) return resolve(null);
+        resolve(await storeCarPhoto(picked.assets[0]));
+      } catch (e) {
+        await clearStep();
+        Alert.alert('Could not add photo', String(e?.message || e));
+        resolve(null);
+      }
+    };
+    Alert.alert('Car photo', undefined, [
+      { text: 'Take photo', onPress: () => run(true) },
+      { text: 'Choose from gallery', onPress: () => run(false) },
+      { text: 'Cancel', style: 'cancel', onPress: () => resolve(null) },
+    ], { cancelable: true, onDismiss: () => resolve(null) });
+  });
+}
+
+/** Shrinks the photo (about 900 px wide) and saves it under the app's documents folder. */
+async function storeCarPhoto(asset) {
+  const dir = new Directory(Paths.document, PHOTO_DIR);
+  if (!dir.exists) dir.create({ intermediates: true, idempotent: true });
+  let ctx = ImageManipulator.manipulate(asset.uri);
+  if (!asset.width || asset.width > 900) ctx = ctx.resize({ width: 900 });
+  const ref = await ctx.renderAsync();
+  const out = await ref.saveAsync({ format: SaveFormat.JPEG, compress: 0.8 });
+  try {
+    ref.release?.();
+  } catch {
+    /* ignore */
+  }
+  const dest = new File(dir, `car-${Date.now()}-${Math.round(Math.random() * 1e6)}.jpg`);
+  await new File(out.uri).move(dest);
+  return dest.uri;
+}
+
+/** Deletes a stored car photo (best effort; ignores anything outside our folder). */
+function deleteCarPhoto(uri) {
+  if (!uri || !uri.includes(`/${PHOTO_DIR}/`)) return;
+  try {
+    const f = new File(uri);
+    if (f.exists) f.delete();
+  } catch {
+    /* ignore */
+  }
+}
+
 const LOGO_MARK = require('./assets/logo-mark.png');
 const LOGO_FULL = require('./assets/logo-full.png');
 
@@ -502,16 +612,16 @@ function Brand({ size = 34 }) {
 
 function PrimaryButton({ label, onPress, disabled, arrow = true, style }) {
   return (
-    <Pressable
+    <PressScale
       onPress={onPress}
       disabled={disabled}
-      style={({ pressed }) => [styles.primaryBtn, disabled && { opacity: 0.45 }, pressed && { opacity: 0.88 }, style]}
+      style={({ pressed }) => [styles.primaryBtn, disabled && { opacity: 0.45 }, pressed && { opacity: 0.9 }, style]}
     >
       <T w="s" style={styles.primaryBtnText}>
         {label}
       </T>
       {arrow && <Feather name="arrow-right" size={22} color="#fff" style={styles.primaryBtnArrow} />}
-    </Pressable>
+    </PressScale>
   );
 }
 
@@ -530,6 +640,29 @@ function ScreenHeader({ title, onBack }) {
 
 function Card({ style, children }) {
   return <View style={[styles.card, style]}>{children}</View>;
+}
+
+/** Full-screen soft colour wash behind the translucent glass surfaces. */
+function GlassBackdrop() {
+  const blob = (id, color, opacity) => (
+    <RadialGradient id={id} cx="50%" cy="50%" r="50%">
+      <Stop offset="0" stopColor={color} stopOpacity={opacity} />
+      <Stop offset="1" stopColor={color} stopOpacity={0} />
+    </RadialGradient>
+  );
+  return (
+    <Svg style={StyleSheet.absoluteFill} pointerEvents="none" width="100%" height="100%" viewBox="0 0 100 200" preserveAspectRatio="none">
+      <Defs>
+        {blob('gb1', C.blob1, 0.55)}
+        {blob('gb2', C.blob2, 0.5)}
+        {blob('gb3', C.blob3, 0.4)}
+      </Defs>
+      <Rect x="0" y="0" width="100" height="200" fill={C.bg} />
+      <Rect x="-40" y="-30" width="110" height="110" fill="url(#gb1)" />
+      <Rect x="35" y="40" width="100" height="110" fill="url(#gb2)" />
+      <Rect x="-35" y="120" width="105" height="105" fill="url(#gb3)" />
+    </Svg>
+  );
 }
 
 function ScanCorners({ color = C.scan, size = 26, thickness = 3 }) {
@@ -577,6 +710,83 @@ function useScanLine(active, distance) {
   return v.interpolate({ inputRange: [0, 1], outputRange: [-distance / 2, distance / 2] });
 }
 
+// ============================================================================
+//  MOTION (built-in Animated, native driver; off when "reduce motion" is on)
+// ============================================================================
+let reduceMotion = false;
+AccessibilityInfo.isReduceMotionEnabled?.()
+  .then((v) => {
+    reduceMotion = !!v;
+  })
+  .catch(() => {});
+AccessibilityInfo.addEventListener?.('reduceMotionChanged', (v) => {
+  reduceMotion = !!v;
+});
+
+// Old-architecture Android needs this for LayoutAnimation ("Know why?" expand).
+if (Platform.OS === 'android' && !global.nativeFabricUIManager && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
+
+/** Fades and slides its children up into place when it mounts. */
+function FadeIn({ delay = 0, from = 12, duration = 320, style, children }) {
+  const v = useRef(new Animated.Value(reduceMotion ? 1 : 0)).current;
+  useEffect(() => {
+    if (reduceMotion) return undefined;
+    const a = Animated.timing(v, { toValue: 1, duration, delay, easing: Easing.out(Easing.cubic), useNativeDriver: true });
+    a.start();
+    return () => a.stop();
+  }, [v, delay, duration]);
+  const translateY = v.interpolate({ inputRange: [0, 1], outputRange: [from, 0] });
+  return <Animated.View style={[style, { opacity: v, transform: [{ translateY }] }]}>{children}</Animated.View>;
+}
+
+/** Springs in from slightly smaller, for cards that deliver a result. */
+function PopIn({ delay = 0, style, children }) {
+  const v = useRef(new Animated.Value(reduceMotion ? 1 : 0)).current;
+  useEffect(() => {
+    if (reduceMotion) return undefined;
+    const a = Animated.spring(v, { toValue: 1, delay, speed: 14, bounciness: 9, useNativeDriver: true });
+    a.start();
+    return () => a.stop();
+  }, [v, delay]);
+  const scale = v.interpolate({ inputRange: [0, 1], outputRange: [0.92, 1] });
+  const opacity = v.interpolate({ inputRange: [0, 0.6, 1], outputRange: [0, 1, 1], extrapolate: 'clamp' });
+  return <Animated.View style={[style, { opacity, transform: [{ scale }] }]}>{children}</Animated.View>;
+}
+
+/** Pressable that shrinks a little while held. `style` may be a function of { pressed }. */
+function PressScale({ style, children, scaleTo = 0.97, ...rest }) {
+  const s = useRef(new Animated.Value(1)).current;
+  const go = (toValue) => Animated.spring(s, { toValue, speed: 40, bounciness: 6, useNativeDriver: true }).start();
+  return (
+    <Pressable {...rest} onPressIn={() => !reduceMotion && go(scaleTo)} onPressOut={() => go(1)}>
+      {(state) => (
+        <Animated.View style={[typeof style === 'function' ? style(state) : style, { transform: [{ scale: s }] }]}>
+          {children}
+        </Animated.View>
+      )}
+    </Pressable>
+  );
+}
+
+/** Slow up-and-down drift, for the welcome illustration. */
+function useFloat(distance = 5, duration = 2200) {
+  const v = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (reduceMotion) return undefined;
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(v, { toValue: 1, duration, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(v, { toValue: 0, duration, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [v, duration]);
+  return v.interpolate({ inputRange: [0, 1], outputRange: [-distance, distance] });
+}
+
 function Stepper({ value, onMinus, onPlus }) {
   return (
     <View style={styles.stepper}>
@@ -603,21 +813,24 @@ function Chip({ label, active, onPress }) {
   );
 }
 
-function RestrictedHours({ color }) {
+/** "7:00–10:00 AM", or "7:00 AM–7:00 PM" when the window crosses noon. */
+function rangeLabel(w) {
+  const start = clockLabel(w.start);
+  const sameMer = (w.start >= 720) === (w.end >= 720);
+  return `${sameMer ? start.slice(0, -3) : start}–${clockLabel(w.end)}`;
+}
+
+function RestrictedHours({ color, city }) {
   return (
     <View style={styles.hoursRow}>
-      <View style={{ flex: 1 }}>
-        <T w="s" style={[styles.hoursTime, { color }]}>
-          7:00–10:00 AM
-        </T>
-        <T style={[styles.hoursLabel, { color }]}>Morning</T>
-      </View>
-      <View style={{ flex: 1 }}>
-        <T w="s" style={[styles.hoursTime, { color }]}>
-          5:00–8:00 PM
-        </T>
-        <T style={[styles.hoursLabel, { color }]}>Evening</T>
-      </View>
+      {rulesFor(city).windows.map((w) => (
+        <View key={w.start} style={{ flex: 1 }}>
+          <T w="s" style={[styles.hoursTime, { color }]}>
+            {rangeLabel(w)}
+          </T>
+          <T style={[styles.hoursLabel, { color }]}>{w.label}</T>
+        </View>
+      ))}
     </View>
   );
 }
@@ -638,15 +851,6 @@ function WeekGuide({ highlightDay, restricted }) {
           </View>
         );
       })}
-    </View>
-  );
-}
-
-function InfoNote({ children }) {
-  return (
-    <View style={styles.infoNote}>
-      <Feather name="info" size={18} color={C.muted} style={{ marginTop: 1 }} />
-      <T style={styles.infoText}>{children}</T>
     </View>
   );
 }
@@ -674,26 +878,35 @@ function RoadLines() {
 
 function OnboardingScreen({ onStart }) {
   const line = useScanLine(true, 60);
+  const float = useFloat();
   return (
     <SafeAreaView style={styles.fill} edges={['top', 'bottom']}>
-      <ScrollView contentContainerStyle={[styles.page, { flexGrow: 1 }]}>
-        <Brand />
+      <ScrollView contentContainerStyle={[styles.page, { flexGrow: 1, paddingBottom: 36 }]}>
+        <FadeIn from={-8}>
+          <Brand />
+        </FadeIn>
         <View style={{ flex: 1, justifyContent: 'center', paddingVertical: 24 }}>
-          <View style={[styles.heroCard, styles.heroCenter, { height: 220 }]}>
-            <RoadLines />
-            <View style={styles.heroFrame}>
-              <ScanCorners />
-              <PlateGraphic width={220} />
-              <Animated.View style={[styles.scanLine, { transform: [{ translateY: line }] }]} />
+          <PopIn delay={100}>
+            <View style={[styles.heroCard, styles.heroCenter, { height: 220 }]}>
+              <RoadLines />
+              <Animated.View style={[styles.heroFrame, { transform: [{ translateY: float }] }]}>
+                <ScanCorners />
+                <PlateGraphic width={220} />
+                <Animated.View style={[styles.scanLine, { transform: [{ translateY: line }] }]} />
+              </Animated.View>
             </View>
-          </View>
-          <T w="b" style={[styles.h1, { marginTop: 30 }]}>
-            Know your coding.{'\n'}Plan your drive.
-          </T>
-          <T style={styles.sub}>Scan or type your plate to see when you can drive.</T>
+          </PopIn>
+          <FadeIn delay={260}>
+            <T w="b" style={[styles.h1, { marginTop: 30 }]}>
+              Know your coding.{'\n'}Plan your drive.
+            </T>
+            <T style={styles.sub}>Scan or type your plate to see when you can drive.</T>
+          </FadeIn>
         </View>
-        <PrimaryButton label="Get started" onPress={onStart} />
-        <T style={[styles.footnote, { textAlign: 'center', marginTop: 14 }]}>Metro Manila · MMDA number coding</T>
+        <FadeIn delay={400}>
+          <PrimaryButton label="Get started" onPress={onStart} />
+          <T style={[styles.footnote, { textAlign: 'center', marginTop: 14 }]}>Metro Manila · MMDA number coding</T>
+        </FadeIn>
       </ScrollView>
     </SafeAreaView>
   );
@@ -741,35 +954,80 @@ function CarEditor({ editor, cars, onClose, onSubmit }) {
   const insets = useSafeAreaInsets();
   const [name, setName] = useState('');
   const [plate, setPlate] = useState('');
+  const [photo, setPhoto] = useState(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (editor) {
       setName(editor.name || '');
       setPlate(editor.plate ? formatPlate(editor.plate) : '');
+      setPhoto(editor.photo || null);
     }
   }, [editor]);
 
   if (!editor) return null;
+  // A photo taken in this sheet but not saved is thrown away (the car keeps its old one).
+  const dropUnsaved = () => {
+    if (photo && photo !== editor.photo) deleteCarPhoto(photo);
+  };
+  const close = () => {
+    dropUnsaved();
+    onClose();
+  };
+  const choosePhoto = async () => {
+    setBusy(true);
+    const uri = await pickCarPhoto();
+    setBusy(false);
+    if (!uri) return;
+    dropUnsaved();
+    setPhoto(uri);
+  };
+  const removePhoto = () => {
+    dropUnsaved();
+    setPhoto(null);
+  };
   const plateEditable = editor.mode === 'add';
   const std = standardizeInput(plate, 'manual');
   const validPlate = !!plateGroup(std.chars);
   const duplicate = cars.find((c) => c.plate === std.plate && c.id !== editor.id);
   const trimmed = name.trim();
   const canSave = trimmed.length > 0 && validPlate && !duplicate;
-  const titles = { add: 'Add a car', save: 'Save this car', rename: 'Rename car' };
+  const titles = { add: 'Add a car', save: 'Save this car', rename: 'Edit car' };
 
   return (
-    <Modal visible transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible transparent animationType="slide" onRequestClose={close}>
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <Pressable style={styles.sheetBackdrop} onPress={onClose} />
+        <Pressable style={styles.sheetBackdrop} onPress={close} />
         <View style={[styles.sheet, { paddingBottom: insets.bottom + 16 }]}>
           <View style={styles.sheetHandle} />
           <T w="b" style={{ fontSize: 20 }}>
             {titles[editor.mode]}
           </T>
-          <T style={{ fontSize: 13, color: C.muted, marginTop: 4 }}>
-            Give it a name you’ll recognize, like “Dad’s Vios” or “Work car”.
-          </T>
+
+          {photo ? (
+            <View style={{ marginTop: 16 }}>
+              <Image source={{ uri: photo }} style={styles.editorPhoto} resizeMode="cover" accessibilityLabel="Car photo" />
+              <View style={[styles.rowBetween, { marginTop: 8 }]}>
+                <Pressable onPress={choosePhoto} disabled={busy} hitSlop={8}>
+                  <T w="s" style={styles.link}>
+                    {busy ? 'Saving photo…' : 'Change photo'}
+                  </T>
+                </Pressable>
+                <Pressable onPress={removePhoto} disabled={busy} hitSlop={8}>
+                  <T w="s" style={[styles.link, { color: C.red }]}>
+                    Remove photo
+                  </T>
+                </Pressable>
+              </View>
+            </View>
+          ) : (
+            <Pressable onPress={choosePhoto} disabled={busy} style={styles.addPhoto} accessibilityRole="button">
+              {busy ? <ActivityIndicator color={C.teal} /> : <Feather name="camera" size={20} color={C.teal} />}
+              <T w="s" style={{ fontSize: 14, color: C.teal, marginLeft: 8 }}>
+                {busy ? 'Saving photo…' : 'Add a photo (optional)'}
+              </T>
+            </Pressable>
+          )}
 
           <T w="s" style={[styles.tinyLabel, { marginTop: 18 }]}>
             CAR NAME
@@ -777,9 +1035,9 @@ function CarEditor({ editor, cars, onClose, onSubmit }) {
           <TextInput
             value={name}
             onChangeText={(t) => setName(t.slice(0, MAX_NAME))}
-            placeholder="My car"
+            placeholder="e.g. Dad’s Vios"
             placeholderTextColor={C.placeholder}
-            autoFocus
+            autoFocus={editor.mode !== 'rename'}
             maxLength={MAX_NAME}
             returnKeyType="done"
             style={styles.sheetInput}
@@ -805,20 +1063,18 @@ function CarEditor({ editor, cars, onClose, onSubmit }) {
             </T>
           )}
           {plateEditable && !!plate.trim() && !validPlate && (
-            <T style={[styles.helper, { color: C.red }]}>Use 3 letters and 4 digits, like NCA 1231.</T>
+            <T style={[styles.helper, { color: C.red }]}>Use 3 letters + 4 digits.</T>
           )}
-          {!!duplicate && (
-            <T style={[styles.helper, { color: C.red }]}>This plate is already saved as “{duplicate.name}”.</T>
-          )}
+          {!!duplicate && <T style={[styles.helper, { color: C.red }]}>Already saved as “{duplicate.name}”.</T>}
 
           <PrimaryButton
-            label={editor.mode === 'rename' ? 'Save name' : 'Save car'}
+            label={editor.mode === 'rename' ? 'Save changes' : 'Save car'}
             arrow={false}
-            disabled={!canSave}
-            onPress={() => onSubmit({ id: editor.id, plate: std.plate, name: trimmed })}
+            disabled={!canSave || busy}
+            onPress={() => onSubmit({ id: editor.id, plate: std.plate, name: trimmed, photo })}
             style={{ marginTop: 20 }}
           />
-          <Pressable onPress={onClose} style={{ alignSelf: 'center', marginTop: 14 }} hitSlop={8}>
+          <Pressable onPress={close} style={{ alignSelf: 'center', marginTop: 14 }} hitSlop={8}>
             <T w="s" style={{ color: C.muted }}>
               Cancel
             </T>
@@ -829,23 +1085,36 @@ function CarEditor({ editor, cars, onClose, onSubmit }) {
   );
 }
 
-const STATUS_STYLE = {
-  coding: { bg: C.redBg, fg: C.red, icon: 'alert-triangle' },
-  codingDay: { bg: C.amberBg, fg: C.amber, icon: 'clock' },
-  free: { bg: C.greenBg, fg: C.green, icon: 'check-circle' },
-  holiday: { bg: C.greenBg, fg: C.green, icon: 'check-circle' },
-  invalid: { bg: C.greyBg, fg: C.body, icon: 'help-circle' },
-};
+// A function, not a constant, so the colors follow light/dark mode.
+const statusStyle = (kind) =>
+  ({
+    coding: { bg: C.redBg, fg: C.red, icon: 'alert-triangle' },
+    codingDay: { bg: C.amberBg, fg: C.amber, icon: 'clock' },
+    free: { bg: C.greenBg, fg: C.green, icon: 'check-circle' },
+    holiday: { bg: C.greenBg, fg: C.green, icon: 'check-circle' },
+    invalid: { bg: C.greyBg, fg: C.body, icon: 'help-circle' },
+  })[kind];
 
 function CarCard({ car, status, onCheck, onRename, onDelete }) {
-  const st = STATUS_STYLE[status.kind];
+  const st = statusStyle(status.kind);
   return (
     <Card style={{ padding: 0, overflow: 'hidden' }}>
+      {!!car.photo && (
+        <Pressable onPress={onRename} accessibilityLabel={`Change photo of ${car.name}`}>
+          <Image source={{ uri: car.photo }} style={styles.carPhoto} resizeMode="cover" />
+        </Pressable>
+      )}
       <View style={{ flexDirection: 'row', alignItems: 'center', padding: 16 }}>
-        <View style={[styles.carIcon, { backgroundColor: st.bg }]}>
-          <MaterialCommunityIcons name="car-side" size={26} color={st.fg} />
-        </View>
-        <View style={{ flex: 1, marginLeft: 14 }}>
+        {!car.photo && (
+          <Pressable
+            onPress={onRename}
+            style={[styles.carIcon, { backgroundColor: st.bg }]}
+            accessibilityLabel={`Add a photo of ${car.name}`}
+          >
+            <MaterialCommunityIcons name="car-side" size={26} color={st.fg} />
+          </Pressable>
+        )}
+        <View style={{ flex: 1, marginLeft: car.photo ? 0 : 14 }}>
           <T w="b" style={{ fontSize: 17 }} numberOfLines={1}>
             {car.name}
           </T>
@@ -862,7 +1131,7 @@ function CarCard({ car, status, onCheck, onRename, onDelete }) {
       </View>
       <View style={styles.carFoot}>
         <T style={{ flex: 1, fontSize: 13, color: status.kind === 'coding' ? C.red : C.body }}>{status.sub}</T>
-        <Pressable onPress={onRename} hitSlop={8} style={styles.carAction} accessibilityLabel={`Rename ${car.name}`}>
+        <Pressable onPress={onRename} hitSlop={8} style={styles.carAction} accessibilityLabel={`Edit ${car.name}`}>
           <Feather name="edit-2" size={17} color={C.muted} />
         </Pressable>
         <Pressable onPress={onDelete} hitSlop={8} style={styles.carAction} accessibilityLabel={`Delete ${car.name}`}>
@@ -879,14 +1148,15 @@ function CarCard({ car, status, onCheck, onRename, onDelete }) {
   );
 }
 
-function MyCarsScreen({ cars, holiday, onAdd, onRename, onDelete, onCheck }) {
+function MyCarsScreen({ cars, holiday, city, onAdd, onRename, onDelete, onCheck }) {
   const [now, setNow] = useState(new Date());
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 30000);
     return () => clearInterval(id);
   }, []);
 
-  const rows = cars.map((car) => ({ car, status: carStatus(car.plate, now, holiday) }));
+  const rows = cars.map((car) => ({ car, status: carStatus(car.plate, now, holiday, city) }));
+  const hol = holidayFor(now, holiday);
   const inCoding = rows.filter((r) => r.status.kind === 'coding').length;
   const dayLabel = `${DAY_NAME[JS_DAY_TO_SYMBOL[now.getDay()]]}, ${label12(now.getHours(), now.getMinutes())}`;
 
@@ -896,10 +1166,9 @@ function MyCarsScreen({ cars, holiday, onAdd, onRename, onDelete, onCheck }) {
       <T w="b" style={[styles.h1, { marginTop: 26 }]}>
         My cars.
       </T>
-      <T style={styles.sub}>Live coding status for every car you’ve saved.</T>
 
       {cars.length > 0 && (
-        <View style={[styles.summary, inCoding ? { backgroundColor: C.redBg } : { backgroundColor: C.greenBg }]}>
+        <PopIn style={[styles.summary, inCoding ? { backgroundColor: C.redBg } : { backgroundColor: C.greenBg }]}>
           <Feather name={inCoding ? 'alert-triangle' : 'check-circle'} size={18} color={inCoding ? C.red : C.green} />
           <View style={{ flex: 1, marginLeft: 10 }}>
             <T w="s" style={{ fontSize: 15, color: inCoding ? C.red : C.green }}>
@@ -912,11 +1181,11 @@ function MyCarsScreen({ cars, holiday, onAdd, onRename, onDelete, onCheck }) {
                 : 'All your cars are free to drive now'}
             </T>
             <T style={{ fontSize: 12, color: C.body, marginTop: 2 }}>
-              As of {dayLabel}
-              {holiday ? ' · Holiday mode on' : ''}
+              As of {dayLabel} · {city}
+              {hol.holiday ? ` · ${hol.holidayName || 'Holiday mode on'}` : ''}
             </T>
           </View>
-        </View>
+        </PopIn>
       )}
 
       {cars.length === 0 ? (
@@ -928,20 +1197,21 @@ function MyCarsScreen({ cars, holiday, onAdd, onRename, onDelete, onCheck }) {
             No cars yet
           </T>
           <T style={{ fontSize: 13, color: C.muted, marginTop: 6, textAlign: 'center', paddingHorizontal: 20 }}>
-            Add your car here, or tap “Save this plate” on a coding result.
+            Add one to see its status here.
           </T>
         </Card>
       ) : (
         <View style={{ gap: 12, marginTop: 16 }}>
-          {rows.map(({ car, status }) => (
-            <CarCard
-              key={car.id}
-              car={car}
-              status={status}
-              onCheck={() => onCheck(car)}
-              onRename={() => onRename(car)}
-              onDelete={() => onDelete(car)}
-            />
+          {rows.map(({ car, status }, i) => (
+            <FadeIn key={car.id} delay={80 + Math.min(i, 6) * 60}>
+              <CarCard
+                car={car}
+                status={status}
+                onCheck={() => onCheck(car)}
+                onRename={() => onRename(car)}
+                onDelete={() => onDelete(car)}
+              />
+            </FadeIn>
           ))}
         </View>
       )}
@@ -952,10 +1222,7 @@ function MyCarsScreen({ cars, holiday, onAdd, onRename, onDelete, onCheck }) {
           Add a car
         </T>
       </Pressable>
-      <T style={[styles.footnote, { marginTop: 14 }]}>
-        Status updates every 30 seconds using the MMDA baseline (weekdays 7–10 AM and 5–8 PM). Cars are saved on this
-        phone only.
-      </T>
+      <T style={[styles.footnote, { marginTop: 14, textAlign: 'center' }]}>Saved on this phone only.</T>
     </ScrollView>
   );
 }
@@ -992,9 +1259,8 @@ function HomeScreen({ plateText, setPlateText, city, onPickCity, onScan, onCheck
       <T w="b" style={[styles.h1, { marginTop: 26 }]}>
         Your plate.{'\n'}Your travel plan.
       </T>
-      <T style={styles.sub}>Check number-coding restrictions before you drive.</T>
 
-      <Pressable onPress={onScan} style={({ pressed }) => [styles.scanCard, pressed && { opacity: 0.92 }]}>
+      <PressScale onPress={onScan} style={({ pressed }) => [styles.scanCard, pressed && { opacity: 0.94 }]}>
         <View style={styles.scanIconTile}>
           <MaterialCommunityIcons name="scan-helper" size={26} color={C.scan} />
         </View>
@@ -1002,17 +1268,14 @@ function HomeScreen({ plateText, setPlateText, city, onPickCity, onScan, onCheck
           <T w="s" style={{ fontSize: 18, color: '#fff' }}>
             Scan your plate
           </T>
-          <T style={{ fontSize: 13, color: '#C3CEDA', marginTop: 4 }}>Use your camera to read the number.</T>
-          <T w="b" style={{ fontSize: 10, color: C.scan, marginTop: 10, letterSpacing: 1 }}>
-            CAMERA + OCR
-          </T>
+          <T style={{ fontSize: 13, color: '#C3CEDA', marginTop: 4 }}>Use your camera</T>
         </View>
         <Feather name="chevron-right" size={24} color="#fff" />
-      </Pressable>
+      </PressScale>
 
       <View style={styles.divider}>
         <View style={styles.dividerLine} />
-        <T style={styles.dividerText}>or enter manually</T>
+        <T style={styles.dividerText}>or type it</T>
         <View style={styles.dividerLine} />
       </View>
 
@@ -1034,7 +1297,6 @@ function HomeScreen({ plateText, setPlateText, city, onPickCity, onScan, onCheck
         />
         <Feather name="edit-2" size={20} color={C.muted} />
       </View>
-      <T style={styles.helper}>Letters and numbers only. No spaces needed.</T>
       <SavedPlates cars={cars} current={plateText} onPick={setPlateText} />
 
       <Pressable onPress={onPickCity} style={[styles.card, styles.locationCard]}>
@@ -1049,13 +1311,14 @@ function HomeScreen({ plateText, setPlateText, city, onPickCity, onScan, onCheck
         </View>
         <Feather name="chevron-down" size={20} color={C.muted} />
       </Pressable>
-      <T style={styles.helper}>Vehicle type: Private car{holiday ? ' · Holiday mode on' : ''}</T>
+      {rulesFor(city).note && <T style={styles.helper}>{rulesFor(city).note}</T>}
+      {(() => {
+        const hol = holidayFor(new Date(), holiday);
+        if (!hol.holiday) return null;
+        return <T style={styles.helper}>{hol.holidayName ? `Today is ${hol.holidayName} · no coding` : 'Holiday mode on'}</T>;
+      })()}
 
       <PrimaryButton label="Check restrictions" onPress={onCheck} disabled={!plateText.trim()} style={{ marginTop: 22 }} />
-      <T w="m" style={[styles.footnote, { marginTop: 16 }]}>
-        Philippines · Metro Manila example
-      </T>
-      <T style={styles.footnote}>Local rules and holiday suspensions may differ.</T>
     </ScrollView>
   );
 }
@@ -1098,7 +1361,6 @@ function ScanScreen({ onBack, onConfirm }) {
   const [torch, setTorch] = useState(false);
   const [plate, setPlate] = useState('');
   const [ocrRaw, setOcrRaw] = useState('');
-  const [reads, setReads] = useState([]);
   const [agreement, setAgreement] = useState(null);
   const [step, setStep] = useState('');
 
@@ -1144,7 +1406,6 @@ function ScanScreen({ onBack, onConfirm }) {
         shots.push(await readShot(pics[i], crop));
       }
       const vote = votePlate(shots.map((r) => r.plate));
-      setReads(shots.map((r) => r.text));
       if (vote) {
         // keep the raw text of a shot that matches the vote, so the result keeps its OCR cleanup steps
         const match = shots.find((r) => r.plate === vote.plate);
@@ -1214,7 +1475,6 @@ function ScanScreen({ onBack, onConfirm }) {
     setPhoto(null);
     setPlate('');
     setOcrRaw('');
-    setReads([]);
     setAgreement(null);
     setPhase('aim');
   };
@@ -1224,10 +1484,6 @@ function ScanScreen({ onBack, onConfirm }) {
   return (
     <ScrollView contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled">
       <ScreenHeader title="Scan plate" onBack={onBack} />
-      <T w="b" style={[styles.h1, { fontSize: 28, marginTop: 22 }]}>
-        Align. Scan. Confirm.
-      </T>
-      <T style={styles.sub}>Keep the entire plate inside the frame.</T>
 
       <View style={styles.cameraCard} onLayout={(e) => setBox({ w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height })}>
         {granted && !photo && (
@@ -1263,7 +1519,7 @@ function ScanScreen({ onBack, onConfirm }) {
               Camera access needed
             </T>
             <T style={{ color: '#C3CEDA', fontSize: 13, marginTop: 4, textAlign: 'center' }}>
-              PlateWise reads your plate from a photo. Nothing is uploaded.
+              Nothing is uploaded.
             </T>
             <Pressable onPress={requestPermission} style={styles.camAllow}>
               <T w="s" style={{ color: C.navy }}>
@@ -1282,7 +1538,7 @@ function ScanScreen({ onBack, onConfirm }) {
               </View>
               <View style={[styles.camStatus, { top: frame.y + frame.h + 14 }]}>
                 {phase === 'aim' && (
-                  <T style={styles.camStatusSub}>Fill the frame with the plate, hold steady, then tap the shutter.</T>
+                  <T style={styles.camStatusSub}>Fit the plate in the frame</T>
                 )}
                 {(phase === 'capturing' || phase === 'reading') && (
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
@@ -1300,11 +1556,11 @@ function ScanScreen({ onBack, onConfirm }) {
                         Plate detected
                       </T>
                     </View>
-                    <T style={styles.camStatusSub}>
-                      {agreement && agreement.total > 1
-                        ? `${agreement.agree} of ${agreement.total} reads agree. Check the characters below.`
-                        : 'Check the characters below to continue.'}
-                    </T>
+                    {agreement && agreement.total > 1 && (
+                      <T style={styles.camStatusSub}>
+                        {agreement.agree}/{agreement.total} reads agree
+                      </T>
+                    )}
                   </>
                 )}
                 {phase === 'notfound' && (
@@ -1315,7 +1571,7 @@ function ScanScreen({ onBack, onConfirm }) {
                         No valid plate found
                       </T>
                     </View>
-                    <T style={styles.camStatusSub}>Move closer, avoid glare, or type it below.</T>
+                    <T style={styles.camStatusSub}>Move closer or type it below</T>
                   </>
                 )}
               </View>
@@ -1331,14 +1587,13 @@ function ScanScreen({ onBack, onConfirm }) {
 
       {!ML_KIT_AVAILABLE && (
         <T style={{ fontSize: 12, color: C.red, marginTop: 10 }}>
-          Scanning only works in the installed PlateWise app (it uses Google ML Kit). Type the plate below instead.
+          Scanning only works in the installed app. Type the plate below.
         </T>
       )}
 
       <T w="b" style={{ fontSize: 20, marginTop: 26 }}>
-        Confirm detected plate
+        Confirm plate
       </T>
-      <T style={[styles.helper, { marginTop: 4 }]}>Tap the plate number to correct any mistakes.</T>
       <View style={[styles.plateInputWrap, { borderColor: C.line, marginTop: 12 }]}>
         <TextInput
           value={plate}
@@ -1364,12 +1619,6 @@ function ScanScreen({ onBack, onConfirm }) {
           </T>
         </Pressable>
       </View>
-      {reads.length > 0 && (
-        <T style={[styles.footnote, { marginTop: 8, fontFamily: MONO }]}>
-          {reads.map((r, i) => `Shot ${i + 1}: ${r}`).join('\n')}
-        </T>
-      )}
-
       <PrimaryButton
         label="Confirm & check"
         arrow={false}
@@ -1377,7 +1626,6 @@ function ScanScreen({ onBack, onConfirm }) {
         onPress={() => onConfirm(plate, ocrRaw)}
         style={{ marginTop: 22 }}
       />
-      <T style={[styles.footnote, { marginTop: 14 }]}>OCR can make mistakes. Always confirm your plate.</T>
     </ScrollView>
   );
 }
@@ -1397,7 +1645,7 @@ function statusFor(check) {
       fg: C.body,
       icon: 'help-circle',
       title: 'Plate not recognized',
-      sub: 'Expected 3 letters and 4 digits, like NCA 1231.',
+      sub: 'Use 3 letters + 4 digits, like NCA 1231.',
     };
   }
   if (result.verdict === VERDICT.CODING) {
@@ -1418,7 +1666,7 @@ function statusFor(check) {
       fg: C.amber,
       icon: 'clock',
       title: `Allowed at ${timeLabel}`,
-      sub: `${codingDayName} is your coding day. Avoid these hours:`,
+      sub: `${codingDayName} coding · avoid these hours`,
       hours: true,
     };
   }
@@ -1429,7 +1677,7 @@ function statusFor(check) {
       fg: C.green,
       icon: 'check-circle',
       title: 'Allowed · holiday',
-      sub: `Coding is lifted on official non-working holidays. Your usual coding day is ${codingDayName}.`,
+      sub: check.holidayName ? `${check.holidayName} · coding is lifted.` : 'Coding is lifted on holidays.',
     };
   }
   const weekend = day === 'Sat' || day === 'Sun';
@@ -1439,34 +1687,32 @@ function statusFor(check) {
     fg: C.green,
     icon: 'check-circle',
     title: `Allowed ${when}`,
-    sub: weekend
-      ? `No coding on weekends. Your coding day is ${codingDayName}.`
-      : `Plate ending ${lastDigit} · your coding day is ${codingDayName}.`,
+    sub: weekend ? 'No coding on weekends.' : `Your coding day is ${codingDayName}.`,
   };
 }
 
 /** Plain-language reason behind a verdict, shown under "Know why?". */
 function whyText(check, st) {
-  const { result, day, holiday, timeLabel, lastDigit } = check;
+  const { result, day, holiday, holidayName, timeLabel, lastDigit, city } = check;
   const cd = result.codingDay;
-  const rule = `MMDA number coding keeps private cars off major roads one weekday a week, based on the plate’s last digit. Plates ending in ${DAY_ENDINGS[cd].replace(' · ', ' or ')} are coded on ${DAY_NAME[cd]}s, 7–10 AM and 5–8 PM.`;
-  const dayName = DAY_NAME[day];
+  const rule = `Plates ending in ${DAY_ENDINGS[cd].replace(' · ', ' or ')} are coded on ${DAY_NAME[cd]}s, ${hoursShort(city, ' and ')}${check.rules.note ? ` in ${city}` : ''}.`;
   let mine;
-  if (st.kind === 'restricted') mine = `Your plate ends in ${lastDigit}, and ${timeLabel} on ${dayName} falls inside the restricted hours.`;
-  else if (st.kind === 'caution')
-    mine = `${dayName} is your coding day, but ${timeLabel} is outside the restricted hours, so you can drive now.`;
-  else if (holiday) mine = `This check is marked as a holiday, and coding is lifted on official non-working holidays.`;
-  else if (day === 'Sat' || day === 'Sun') mine = `Coding doesn’t apply on weekends, so you can drive any time.`;
-  else mine = `Your plate ends in ${lastDigit}, so ${dayName} isn’t your coding day. You can drive any time.`;
-  return `${rule}\n\n${mine}`;
+  if (st.kind === 'restricted') mine = `Yours ends in ${lastDigit}, and ${timeLabel} is inside those hours.`;
+  else if (st.kind === 'caution') mine = `${timeLabel} is outside those hours.`;
+  else if (holiday) mine = holidayName ? `${holidayName} is a holiday, so coding is lifted.` : 'Holidays are exempt.';
+  else if (day === 'Sat' || day === 'Sun') mine = 'Weekends are exempt.';
+  else mine = `Yours ends in ${lastDigit}, so ${DAY_NAME[day]} is free.`;
+  return `${rule} ${mine}`;
 }
 
 function ResultScreen({ check, onBack, onAnother, cars, onSave }) {
   const savedCar = cars.find((c) => c.plate === check.std.plate);
   const st = statusFor(check);
   const [why, setWhy] = useState(false);
+  const chevron = useRef(new Animated.Value(0)).current;
   const toggleWhy = () => {
-    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    if (!reduceMotion) LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    Animated.timing(chevron, { toValue: why ? 0 : 1, duration: 220, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
     setWhy((w) => !w);
   };
   const dayText = `${DAY_NAME[check.day].toUpperCase()}${check.holiday ? ' (HOLIDAY)' : ''}, ${check.timeLabel}`;
@@ -1501,9 +1747,11 @@ function ResultScreen({ check, onBack, onAnother, cars, onSave }) {
         </View>
       </Card>
 
-      <View style={[styles.statusCard, { backgroundColor: st.bg }]}>
+      <PopIn delay={140} style={[styles.statusCard, { backgroundColor: st.bg }]}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-          <Feather name={st.icon} size={24} color={st.fg} />
+          <PopIn delay={320}>
+            <Feather name={st.icon} size={24} color={st.fg} />
+          </PopIn>
           <T w="b" style={{ fontSize: 22, color: st.fg, marginLeft: 10, flex: 1 }}>
             {st.title}
           </T>
@@ -1511,10 +1759,8 @@ function ResultScreen({ check, onBack, onAnother, cars, onSave }) {
         <T w="m" style={{ fontSize: 14, color: st.fg, marginTop: 8 }}>
           {st.sub}
         </T>
-        {st.kind === 'invalid' && (
-          <T style={{ fontSize: 13, color: C.body, marginTop: 8 }}>
-            {check.std.plate ? `We read “${check.std.plate}”. Check the plate and try again.` : 'No plate was entered.'}
-          </T>
+        {st.kind === 'invalid' && !!check.std.plate && (
+          <T style={{ fontSize: 13, color: C.body, marginTop: 8 }}>Read as “{check.std.plate}”.</T>
         )}
         {st.hours && (
           <>
@@ -1522,13 +1768,13 @@ function ResultScreen({ check, onBack, onAnother, cars, onSave }) {
             <T w="b" style={{ fontSize: 11, letterSpacing: 0.8, color: st.fg }}>
               RESTRICTED HOURS
             </T>
-            <RestrictedHours color={st.fg} />
+            <RestrictedHours color={st.fg} city={check.city} />
           </>
         )}
-      </View>
+      </PopIn>
 
       {st.kind !== 'invalid' && (
-        <View style={[styles.card, styles.whyCard]}>
+        <FadeIn delay={280} style={[styles.card, styles.whyCard]}>
           <Pressable
             onPress={toggleWhy}
             style={styles.whyHead}
@@ -1539,11 +1785,13 @@ function ResultScreen({ check, onBack, onAnother, cars, onSave }) {
             <T w="s" style={{ flex: 1, marginLeft: 10, fontSize: 15, color: C.teal }}>
               Know why?
             </T>
-            <Feather name={why ? 'chevron-up' : 'chevron-down'} size={20} color={C.teal} />
+            <Animated.View style={{ transform: [{ rotate: chevron.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '180deg'] }) }] }}>
+              <Feather name="chevron-down" size={20} color={C.teal} />
+            </Animated.View>
           </Pressable>
 
           {why && (
-            <View style={styles.whyBody}>
+            <FadeIn from={6} duration={260} style={styles.whyBody}>
               <T style={styles.guideLine}>{whyText(check, st)}</T>
 
               <T w="s" style={[styles.tinyLabel, { marginTop: 18, marginBottom: 8 }]}>
@@ -1554,20 +1802,20 @@ function ResultScreen({ check, onBack, onAnother, cars, onSave }) {
               <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 16 }}>
                 <Feather name="map-pin" size={16} color={C.muted} />
                 <T style={{ fontSize: 13, color: C.muted, marginLeft: 8, flex: 1 }}>
-                  {check.city}, Metro Manila · MMDA baseline · Private car
+                  {check.city} · {check.rules.source === 'MMDA UVVRP' ? 'MMDA UVVRP (Mitra, 2026)' : check.rules.source}
                 </T>
               </View>
-
-              <InfoNote>Holidays, exemptions and local rules may differ. Verify official advisories before travelling.</InfoNote>
-              <T style={[styles.footnote, { marginTop: 10 }]}>
-                Baseline: MMDA UVVRP, weekdays 7–10 AM and 5–8 PM (Mitra, 2026).
+              <T style={[styles.footnote, { marginTop: 8 }]}>
+                {check.rules.note || 'Local rules may differ.'}
               </T>
-            </View>
+            </FadeIn>
           )}
-        </View>
+        </FadeIn>
       )}
 
-      <PrimaryButton label="Check another plate" arrow={false} onPress={onAnother} style={{ marginTop: 20 }} />
+      <FadeIn delay={360}>
+        <PrimaryButton label="Check another plate" arrow={false} onPress={onAnother} style={{ marginTop: 20 }} />
+      </FadeIn>
     </ScrollView>
   );
 }
@@ -1575,16 +1823,22 @@ function ResultScreen({ check, onBack, onAnother, cars, onSave }) {
 // ============================================================================
 //  SCHEDULE TAB
 // ============================================================================
-function ScheduleScreen({ plateText, setPlateText, holiday, setHoliday, onRunScheduled, cars }) {
+function ScheduleScreen({ plateText, setPlateText, holiday, setHoliday, onRunScheduled, cars, city }) {
   const std = standardizeInput(plateText, 'manual');
   const group = plateGroup(std.chars);
   const codingDay = group ? GROUP_CODING_DAY[group] : null;
-  const today = JS_DAY_TO_SYMBOL[new Date().getDay()];
+  const now = new Date();
+  const today = JS_DAY_TO_SYMBOL[now.getDay()];
+  const todayHol = holidayFor(now, holiday);
+  const upcoming = nextHoliday(now);
 
   const [day, setDay] = useState(today === 'Sat' || today === 'Sun' ? 'Mon' : today);
   const [hour12, setHour12] = useState(8);
   const [minute, setMinute] = useState(0);
   const [mer, setMer] = useState('AM');
+  // The picked day means its next date; a national holiday on that date lifts coding automatically.
+  const pickedDate = day === 'Hol' ? null : nextDateFor(day, now);
+  const pickedHoliday = pickedDate ? holidayOn(pickedDate) : null;
   const presets = [
     ['7:00 AM', 7, 0, 'AM'],
     ['10:00 AM', 10, 0, 'AM'],
@@ -1601,7 +1855,7 @@ function ScheduleScreen({ plateText, setPlateText, holiday, setHoliday, onRunSch
         Your coding week.
       </T>
       <T style={styles.sub}>
-        {group ? `Plate ${formatPlate(std.plate)} · coding every ${DAY_NAME[codingDay]}.` : 'Enter a plate to see its coding days.'}
+        {group ? `Coding every ${DAY_NAME[codingDay]}.` : 'Enter a plate.'}
       </T>
 
       <View style={[styles.plateInputWrap, { marginTop: 18 }]}>
@@ -1617,13 +1871,17 @@ function ScheduleScreen({ plateText, setPlateText, holiday, setHoliday, onRunSch
         />
         <Feather name="edit-2" size={18} color={C.muted} />
       </View>
-      {!!plateText.trim() && !group && <T style={[styles.helper, { color: C.red }]}>Not a valid plate (3 letters + 4 digits).</T>}
+      {!!plateText.trim() && !group && <T style={[styles.helper, { color: C.red }]}>Use 3 letters + 4 digits.</T>}
       <SavedPlates cars={cars} current={plateText} onPick={setPlateText} />
 
       <Card style={{ marginTop: 18, paddingVertical: 4 }}>
         {WEEK.map((d, i) => {
           const isCoding = d === codingDay;
           const isToday = d === today;
+          // Each row is the next date that falls on that day (this week's, today included).
+          const date = nextDateFor(d, now);
+          const liftedName = holidayOn(date);
+          const lifted = !!liftedName || (isToday && todayHol.holiday);
           return (
             <View key={d} style={[styles.weekRow, i < WEEK.length - 1 && { borderBottomWidth: 1, borderBottomColor: C.line }]}>
               <View style={{ width: 112, flexDirection: 'row', alignItems: 'center' }}>
@@ -1641,10 +1899,12 @@ function ScheduleScreen({ plateText, setPlateText, holiday, setHoliday, onRunSch
               <View style={{ flex: 1, alignItems: 'flex-end' }}>
                 {isCoding ? (
                   <>
-                    <T w="s" style={{ fontSize: 14, color: holiday && isToday ? C.green : C.red }}>
-                      {holiday && isToday ? 'Lifted (holiday)' : 'Coding'}
+                    <T w="s" style={{ fontSize: 14, color: lifted ? C.green : C.red }}>
+                      {lifted ? 'Lifted (holiday)' : 'Coding'}
                     </T>
-                    <T style={{ fontSize: 12, color: C.muted }}>7–10 AM · 5–8 PM</T>
+                    <T style={{ fontSize: 12, color: C.muted }}>
+                      {liftedName ? `${liftedName}, ${shortDate(date)}` : hoursShort(city)}
+                    </T>
                   </>
                 ) : (
                   <T style={{ fontSize: 14, color: C.muted }}>{group ? 'No coding' : '—'}</T>
@@ -1661,16 +1921,25 @@ function ScheduleScreen({ plateText, setPlateText, holiday, setHoliday, onRunSch
             Today is a holiday
           </T>
           <T style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
-            Coding is lifted on official non-working holidays. Turn this on to treat today as one.
+            {todayHol.auto
+              ? `${todayHol.holidayName} · set automatically`
+              : upcoming
+              ? `Next: ${upcoming.name}, ${shortDate(upcoming.date)}. Turn on for Eid or local holidays.`
+              : 'Turn on for Eid or local holidays.'}
           </T>
         </View>
-        <Switch value={holiday} onValueChange={setHoliday} trackColor={{ true: C.teal, false: C.switchOff }} thumbColor="#fff" />
+        <Switch
+          value={todayHol.holiday}
+          onValueChange={setHoliday}
+          disabled={todayHol.auto}
+          trackColor={{ true: C.teal, false: C.switchOff }}
+          thumbColor="#fff"
+        />
       </Card>
 
       <T w="b" style={{ fontSize: 18, marginTop: 26 }}>
         Check a specific time
       </T>
-      <T style={[styles.helper, { marginTop: 4 }]}>Pick any day and time to run the same check.</T>
       <Card style={{ marginTop: 12 }}>
         <T w="s" style={styles.tinyLabel}>
           DAY
@@ -1707,14 +1976,23 @@ function ScheduleScreen({ plateText, setPlateText, holiday, setHoliday, onRunSch
           ))}
         </View>
         <T style={[styles.helper, { marginTop: 10 }]}>
-          Time symbol: <T w="b">{timeToSymbol(to24(hour12, mer), minute)}</T>{' '}
-          {timeToSymbol(to24(hour12, mer), minute) === 'p' ? '(peak hours)' : '(non-peak)'}
+          {timeToSymbol(to24(hour12, mer), minute, city) === 'p' ? 'Peak hours' : 'Off-peak'}
+          {` · ${city}`}
+          {pickedHoliday ? ` · ${pickedHoliday} (${shortDate(pickedDate)})` : ''}
         </T>
       </Card>
       <PrimaryButton
         label="Check this time"
         disabled={!plateText.trim()}
-        onPress={() => onRunScheduled({ day: day === 'Hol' ? today : day, holiday: day === 'Hol', h24: to24(hour12, mer), m: minute })}
+        onPress={() =>
+          onRunScheduled({
+            day: day === 'Hol' ? today : day,
+            holiday: day === 'Hol' || !!pickedHoliday,
+            holidayName: pickedHoliday,
+            h24: to24(hour12, mer),
+            m: minute,
+          })
+        }
         style={{ marginTop: 16 }}
       />
     </ScrollView>
@@ -1755,7 +2033,7 @@ function GuideScreen() {
       <T w="b" style={[styles.h1, { marginTop: 26 }]}>
         How coding works.
       </T>
-      <T style={styles.sub}>The MMDA number-coding scheme (UVVRP) limits private cars by their plate’s last digit.</T>
+      <T style={styles.sub}>Your plate’s last digit sets your coding day.</T>
 
       <Card style={{ marginTop: 18 }}>
         <T w="s" style={styles.tinyLabel}>
@@ -1773,12 +2051,10 @@ function GuideScreen() {
         <T w="s" style={{ fontSize: 15 }}>
           When coding doesn’t apply
         </T>
-        <T style={styles.guideLine}>• Saturdays and Sundays</T>
-        <T style={styles.guideLine}>• Official non-working holidays (turn on Holiday in Schedule)</T>
-        <T style={styles.guideLine}>• Outside 7–10 AM and 5–8 PM on your coding day</T>
-        <T style={[styles.guideLine, { color: C.muted }]}>
-          Public utility vehicles and other exempt types follow separate rules and aren’t covered here.
-        </T>
+        <T style={styles.guideLine}>• Weekends</T>
+        <T style={styles.guideLine}>• Regular and special non-working holidays (detected automatically, 2026–2027)</T>
+        <T style={styles.guideLine}>• Outside 7–10 AM and 5–8 PM</T>
+        <T style={styles.guideLine}>• In Makati: outside 7 AM–7 PM (no window hours)</T>
       </Card>
 
       <AppearanceCard />
@@ -1805,8 +2081,24 @@ function GuideScreen() {
 // ============================================================================
 //  BOTTOM TABS
 // ============================================================================
-function TabBar({ tab, onTab }) {
+function TabBar({ tab, onTab, blurTarget }) {
   const insets = useSafeAreaInsets();
+  const { scheme } = useTheme();
+  // Where each tab's icon sits, measured on layout, so one teal pill can slide between them.
+  const [slots, setSlots] = useState({});
+  const pillX = useRef(new Animated.Value(0)).current;
+  const placed = useRef(false);
+  const target = slots[tab];
+  useEffect(() => {
+    if (!target) return;
+    const x = target.x + (target.w - 54) / 2;
+    if (!placed.current || reduceMotion) {
+      pillX.setValue(x);
+      placed.current = true;
+    } else {
+      Animated.spring(pillX, { toValue: x, speed: 16, bounciness: 7, useNativeDriver: true }).start();
+    }
+  }, [target, pillX]);
   const tabs = [
     ['check', 'Check plate', (c) => <MaterialCommunityIcons name="car-outline" size={24} color={c} />],
     ['cars', 'My cars', (c) => <MaterialCommunityIcons name="car-multiple" size={23} color={c} />],
@@ -1814,20 +2106,40 @@ function TabBar({ tab, onTab }) {
     ['guide', 'Guide', (c) => <Feather name="help-circle" size={22} color={c} />],
   ];
   return (
-    <View style={[styles.tabBarWrap, { paddingBottom: Math.max(insets.bottom, 10) }]}>
+    <View pointerEvents="box-none" style={[styles.tabBarWrap, { paddingBottom: Math.max(insets.bottom, 10) }]}>
       <View style={styles.tabBar}>
+        {/* Frosted glass: real blur of the screen behind, plus a thin tint for legibility. */}
+        <BlurView
+          pointerEvents="none"
+          intensity={70}
+          tint={scheme === 'dark' ? 'dark' : 'light'}
+          blurMethod="dimezisBlurViewSdk31Plus"
+          blurTarget={blurTarget}
+          style={StyleSheet.absoluteFill}
+        />
+        <View pointerEvents="none" style={[StyleSheet.absoluteFill, { backgroundColor: C.tabFill }]} />
+        {!!target && (
+          <Animated.View
+            pointerEvents="none"
+            style={[styles.tabIcon, styles.tabPill, { top: target.y, transform: [{ translateX: pillX }] }]}
+          />
+        )}
         {tabs.map(([key, label, icon]) => {
           const on = tab === key;
           return (
             <Pressable
               key={key}
               onPress={() => onTab(key)}
+              onLayout={(e) => {
+                const { x, y, width } = e.nativeEvent.layout;
+                setSlots((s) => ({ ...s, [key]: { x, y, w: width } }));
+              }}
               style={styles.tabItem}
               accessibilityRole="tab"
               accessibilityState={{ selected: on }}
             >
-              <View style={[styles.tabIcon, on && { backgroundColor: C.teal }]}>{icon(on ? '#fff' : C.navMuted)}</View>
-              <T w={on ? 's' : 'm'} style={{ fontSize: 11, color: on ? '#fff' : C.navMuted, marginTop: 4 }} numberOfLines={1}>
+              <View style={[styles.tabIcon, on && !target && { backgroundColor: C.teal }]}>{icon(on ? '#fff' : C.tabInactive)}</View>
+              <T w={on ? 's' : 'm'} style={{ fontSize: 11, color: on ? C.teal : C.tabInactive, marginTop: 4 }} numberOfLines={1}>
                 {label}
               </T>
             </Pressable>
@@ -1842,6 +2154,8 @@ function TabBar({ tab, onTab }) {
 //  MAIN SHELL
 // ============================================================================
 function MainApp() {
+  const insets = useSafeAreaInsets();
+  const blurTarget = useRef(null); // what the glass tab bar blurs (Android needs an explicit target)
   const [tab, setTab] = useState('check');
   const [route, setRoute] = useState('home'); // home | scan | result
   const [plateText, setPlateText] = useState('');
@@ -1885,23 +2199,33 @@ function MainApp() {
     setCars(list);
     AsyncStorage.setItem(CARS_KEY, JSON.stringify(list)).catch(() => {});
   };
-  const submitCar = ({ id, plate, name }) => {
-    if (id) persistCars(cars.map((c) => (c.id === id ? { ...c, name, plate } : c)));
-    else if (cars.length >= MAX_SAVED) {
+  const submitCar = ({ id, plate, name, photo = null }) => {
+    if (id) {
+      const old = cars.find((c) => c.id === id);
+      if (old?.photo && old.photo !== photo) deleteCarPhoto(old.photo); // replaced or removed
+      persistCars(cars.map((c) => (c.id === id ? { ...c, name, plate, photo } : c)));
+    } else if (cars.length >= MAX_SAVED) {
       Alert.alert('Garage full', `You can save up to ${MAX_SAVED} cars. Remove one in My cars first.`);
       return;
-    } else persistCars([...cars, { id: `${Date.now()}-${Math.round(Math.random() * 1e6)}`, plate, name }]);
+    } else persistCars([...cars, { id: `${Date.now()}-${Math.round(Math.random() * 1e6)}`, plate, name, photo }]);
     setEditor(null);
   };
   const deleteCar = (car) =>
     Alert.alert('Remove car?', `Remove “${car.name}” (${formatPlate(car.plate)}) from My cars?`, [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Remove', style: 'destructive', onPress: () => persistCars(cars.filter((c) => c.id !== car.id)) },
+      {
+        text: 'Remove',
+        style: 'destructive',
+        onPress: () => {
+          deleteCarPhoto(car.photo);
+          persistCars(cars.filter((c) => c.id !== car.id));
+        },
+      },
     ]);
   const openSave = (plate, existing) =>
     setEditor(
       existing
-        ? { mode: 'rename', id: existing.id, plate: existing.plate, name: existing.name }
+        ? { mode: 'rename', id: existing.id, plate: existing.plate, name: existing.name, photo: existing.photo }
         : { mode: 'save', plate, name: cars.length ? '' : 'My car' }
     );
   const rememberLast = (c) => {
@@ -1921,7 +2245,7 @@ function MainApp() {
       day: JS_DAY_TO_SYMBOL[now.getDay()],
       h24: now.getHours(),
       m: now.getMinutes(),
-      holiday,
+      ...holidayFor(now, holiday),
       mode: 'live',
       city,
     });
@@ -1931,8 +2255,8 @@ function MainApp() {
     setRoute('result');
   };
 
-  const runScheduled = ({ day, holiday: hol, h24, m }) => {
-    const c = buildCheck({ raw: plateText, source: 'manual', day, h24, m, holiday: hol, mode: 'scheduled', city });
+  const runScheduled = ({ day, holiday: hol, holidayName, h24, m }) => {
+    const c = buildCheck({ raw: plateText, source: 'manual', day, h24, m, holiday: hol, holidayName, mode: 'scheduled', city });
     rememberLast(c);
     setCheck(c);
     setTab('check');
@@ -1964,6 +2288,7 @@ function MainApp() {
         setHoliday={setHoliday}
         onRunScheduled={runScheduled}
         cars={cars}
+        city={city}
       />
     );
   } else if (tab === 'guide') {
@@ -1973,8 +2298,9 @@ function MainApp() {
       <MyCarsScreen
         cars={cars}
         holiday={holiday}
+        city={city}
         onAdd={() => setEditor({ mode: 'add', plate: '', name: cars.length ? '' : 'My car' })}
-        onRename={(car) => setEditor({ mode: 'rename', id: car.id, plate: car.plate, name: car.name })}
+        onRename={(car) => setEditor({ mode: 'rename', id: car.id, plate: car.plate, name: car.name, photo: car.photo })}
         onDelete={deleteCar}
         onCheck={(car) => {
           setPlateText(formatPlate(car.plate));
@@ -2022,9 +2348,16 @@ function MainApp() {
   }
 
   return (
-    <SafeAreaView style={styles.fill} edges={['top']}>
-      <View style={styles.fill}>{body}</View>
+    <View style={styles.fill}>
+      {/* Screens scroll underneath the floating tab bar, which blurs them. */}
+      <BlurTargetView ref={blurTarget} style={styles.fill}>
+        <GlassBackdrop />
+        <FadeIn key={`${tab}:${route}`} from={10} duration={260} style={[styles.fill, { paddingTop: insets.top }]}>
+          {body}
+        </FadeIn>
+      </BlurTargetView>
       <TabBar
+        blurTarget={blurTarget}
         tab={tab}
         onTab={(t) => {
           if (t === 'check' && (tab === 'check' || route === 'scan')) setRoute('home'); // re-tap returns home
@@ -2041,7 +2374,7 @@ function MainApp() {
           setCityOpen(false);
         }}
       />
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -2105,11 +2438,11 @@ const ONBOARD_KEY = 'platewise.onboarded.v1';
 
 export default function App() {
   const [fontsLoaded] = useFonts({
-    Inter_400Regular: require('@expo-google-fonts/inter/400Regular/Inter_400Regular.ttf'),
-    Inter_500Medium: require('@expo-google-fonts/inter/500Medium/Inter_500Medium.ttf'),
-    Inter_600SemiBold: require('@expo-google-fonts/inter/600SemiBold/Inter_600SemiBold.ttf'),
-    Inter_700Bold: require('@expo-google-fonts/inter/700Bold/Inter_700Bold.ttf'),
-    Inter_800ExtraBold: require('@expo-google-fonts/inter/800ExtraBold/Inter_800ExtraBold.ttf'),
+    Geist_400Regular: require('@expo-google-fonts/geist/400Regular/Geist_400Regular.ttf'),
+    Geist_500Medium: require('@expo-google-fonts/geist/500Medium/Geist_500Medium.ttf'),
+    Geist_600SemiBold: require('@expo-google-fonts/geist/600SemiBold/Geist_600SemiBold.ttf'),
+    Geist_700Bold: require('@expo-google-fonts/geist/700Bold/Geist_700Bold.ttf'),
+    Geist_800ExtraBold: require('@expo-google-fonts/geist/800ExtraBold/Geist_800ExtraBold.ttf'),
   });
   const [splashDone, setSplashDone] = useState(false);
   const [onboarded, setOnboarded] = useState(null); // null = still reading storage
@@ -2188,7 +2521,10 @@ export default function App() {
     <ThemeContext.Provider value={theme}>
       <SafeAreaProvider>
         <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
-        <View style={[styles.fill, { backgroundColor: C.bg }]}>{screen}</View>
+        <View style={[styles.fill, { backgroundColor: C.bg }]}>
+          <GlassBackdrop />
+          {screen}
+        </View>
       </SafeAreaProvider>
     </ThemeContext.Provider>
   );
@@ -2201,7 +2537,7 @@ export default function App() {
 let styles = makeStyles();
 function makeStyles() {
   return StyleSheet.create({
-  fill: { flex: 1, backgroundColor: C.bg },
+  fill: { flex: 1 }, // transparent so the glass backdrop shows through
   iconBtn: {
     width: 40,
     height: 40,
@@ -2212,7 +2548,7 @@ function makeStyles() {
     borderWidth: 1,
     borderColor: C.cardLine,
   },
-  page: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 36 },
+  page: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 130 }, // room to scroll past the floating tab bar
   brand: { flexDirection: 'row', alignItems: 'center' },
   topRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
@@ -2226,11 +2562,13 @@ function makeStyles() {
   fieldLabel: { fontSize: 14, marginBottom: 10 },
   link: { fontSize: 13, color: C.teal },
 
-  card: { backgroundColor: C.card, borderRadius: 16, padding: 16, borderWidth: 1, borderColor: C.cardLine },
+  card: { backgroundColor: C.card, borderRadius: 22, padding: 16, borderWidth: 1, borderColor: C.cardLine },
 
   primaryBtn: {
     height: 56,
-    borderRadius: 16,
+    borderRadius: 28,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.28)', // glass rim
     backgroundColor: C.teal,
     alignItems: 'center',
     justifyContent: 'center',
@@ -2264,7 +2602,9 @@ function makeStyles() {
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: C.navy,
-    borderRadius: 22,
+    borderRadius: 26,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.14)', // glass rim
     padding: 18,
     marginTop: 24,
   },
@@ -2293,7 +2633,7 @@ function makeStyles() {
 
   // sheet
   sheetBackdrop: { flex: 1, backgroundColor: C.backdrop },
-  sheet: { backgroundColor: C.card, borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 20, paddingTop: 10 },
+  sheet: { backgroundColor: C.sheet, borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingHorizontal: 20, paddingTop: 10 },
   sheetHandle: { alignSelf: 'center', width: 40, height: 4, borderRadius: 2, backgroundColor: C.line, marginBottom: 14 },
   sheetRow: {
     flexDirection: 'row',
@@ -2355,8 +2695,6 @@ function makeStyles() {
   weekCell: { flex: 1, alignItems: 'center', paddingVertical: 12, borderRadius: 12 },
   weekDay: { fontSize: 11, color: C.muted, letterSpacing: 0.5 },
   weekEnd: { fontSize: 15, color: C.ink, marginTop: 6 },
-  infoNote: { flexDirection: 'row', backgroundColor: C.infoBg, borderRadius: 14, padding: 14, marginTop: 14, gap: 10 },
-  infoText: { flex: 1, fontSize: 13, color: C.body, lineHeight: 19 },
   whyCard: { marginTop: 14, padding: 0, overflow: 'hidden' },
   whyHead: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 15 },
   whyBody: { paddingHorizontal: 16, paddingBottom: 16, borderTopWidth: 1, borderTopColor: C.rowLine, paddingTop: 14 },
@@ -2389,6 +2727,19 @@ function makeStyles() {
 
   // my cars
   carIcon: { width: 48, height: 48, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+  carPhoto: { width: '100%', aspectRatio: 16 / 9, backgroundColor: C.surfaceAlt },
+  editorPhoto: { width: '100%', aspectRatio: 16 / 9, borderRadius: 16, backgroundColor: C.surfaceAlt },
+  addPhoto: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: 54,
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: C.tealLine,
+    borderStyle: 'dashed',
+    marginTop: 16,
+  },
   statusPill: { flexDirection: 'row', alignItems: 'center', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6 },
   carFoot: {
     flexDirection: 'row',
@@ -2428,20 +2779,18 @@ function makeStyles() {
   guideLine: { fontSize: 13, color: C.body, lineHeight: 19 },
 
   // tabs
-  tabBarWrap: { backgroundColor: C.bg, paddingHorizontal: 14, paddingTop: 6 },
+  tabBarWrap: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: 14, paddingTop: 6 },
   tabBar: {
     flexDirection: 'row',
-    backgroundColor: C.nav,
-    borderRadius: 22,
+    borderRadius: 30,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: C.tabRim,
     paddingVertical: 9,
     paddingHorizontal: 4,
-    shadowColor: '#0F2238',
-    shadowOpacity: 0.18,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 4 },
-    elevation: 8,
   },
   tabItem: { flex: 1, alignItems: 'center' },
   tabIcon: { width: 54, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
+  tabPill: { position: 'absolute', left: 0, backgroundColor: C.teal },
   });
 }
