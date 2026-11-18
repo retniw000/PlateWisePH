@@ -32,7 +32,11 @@
           "image": "./assets/splash-icon.png",
           "imageWidth": 200,
           "resizeMode": "contain",
-          "backgroundColor": "#F5F7FA"
+          "backgroundColor": "#EEF2F7",
+          "dark": {
+            "image": "./assets/splash-icon-dark.png",
+            "backgroundColor": "#0B1420"
+          }
         }
       ],
       [
@@ -51,7 +55,7 @@
       ],
       "expo-font"
     ],
-    "backgroundColor": "#F5F7FA",
+    "backgroundColor": "#EEF2F7",
     "extra": {
       "eas": {
         "projectId": "32888102-a271-41ed-bf7a-ee4295e7a84f"

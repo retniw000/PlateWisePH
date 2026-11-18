@@ -583,7 +583,8 @@ function deleteCarPhoto(uri) {
 }
 
 const LOGO_MARK = require('./assets/logo-mark.png');
-const LOGO_FULL = require('./assets/logo-full.png');
+const LOGO_FULL = require('./assets/logo-full.png'); // navy wordmark, for light mode
+const LOGO_FULL_DARK = require('./assets/logo-full-dark.png'); // white wordmark, for dark mode
 
 // ============================================================================
 //  SHARED UI
@@ -599,7 +600,7 @@ function T({ style, w = 'r', children, ...rest }) {
 function Brand({ size = 34 }) {
   return (
     <View style={styles.brand}>
-      <Image source={LOGO_MARK} style={{ width: size, height: size * 0.79 }} resizeMode="contain" />
+      <Image source={LOGO_MARK} style={{ width: size, height: size * 0.8 }} resizeMode="contain" />
       <T w="b" style={{ fontSize: size * 0.68, marginLeft: 8, letterSpacing: -0.3 }}>
         PlateWise
       </T>
@@ -859,9 +860,15 @@ function WeekGuide({ highlightDay, restricted }) {
 //  SPLASH + ONBOARDING
 // ============================================================================
 function SplashView() {
+  const { scheme } = useTheme();
   return (
     <View style={[styles.fill, { alignItems: 'center', justifyContent: 'center', backgroundColor: C.bg }]}>
-      <Image source={LOGO_FULL} style={{ width: 230, height: 246 }} resizeMode="contain" />
+      <Image
+        source={scheme === 'dark' ? LOGO_FULL_DARK : LOGO_FULL}
+        style={{ width: 230, height: 249 }}
+        resizeMode="contain"
+        accessibilityLabel="PlateWise PH. Plan your travel wisely."
+      />
     </View>
   );
 }
